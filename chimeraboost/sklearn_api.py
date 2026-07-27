@@ -11,7 +11,7 @@ from .preprocessing import CatTransformCache, as_model_array
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 
 
-def _fit_temperature(raw, y, multiclass):
+def _fit_temperature(raw, y, multiclass, sample_weight=None):
     """Learn the scalar T > 0 minimizing validation log loss of sigmoid(raw/T)
     (binary) or softmax(raw/T) (multiclass). Dividing logits by T is monotonic,
     so predictions are unchanged â€” only their probabilities are recalibrated.
@@ -19,6 +19,26 @@ def _fit_temperature(raw, y, multiclass):
     from scipy.optimize import minimize_scalar
 
     raw = np.asarray(raw, dtype=np.float64)
+    weight = None
+    if sample_weight is not None:
+        weight = np.asarray(sample_weight, dtype=np.float64)
+        if weight.shape != (raw.shape[0],):
+            raise ValueError(
+                "temperature sample_weight must match the validation rows"
+            )
+        if not np.all(np.isfinite(weight)) or np.any(weight < 0.0):
+            raise ValueError(
+                "temperature sample_weight must be finite and nonnegative"
+            )
+        weight_sum = float(weight.sum())
+        if weight_sum <= 0.0:
+            return 1.0
+
+    def reduce_loss(per_row):
+        if weight is None:
+            return float(np.mean(per_row))
+        return float(np.dot(weight, per_row) / weight_sum)
+
     if multiclass:
         rows = np.arange(raw.shape[0])
 
@@ -26,13 +46,15 @@ def _fit_temperature(raw, y, multiclass):
             logits = raw / T
             mx = logits.max(axis=1, keepdims=True)
             log_z = mx[:, 0] + np.log(np.exp(logits - mx).sum(axis=1))
-            return float(np.mean(log_z - logits[rows, y]))
+            return reduce_loss(log_z - logits[rows, y])
     else:
         def loss(T):
             z = raw / T
             # Stable binary cross-entropy: softplus(z) - y*z.
-            return float(np.mean(np.log1p(np.exp(-np.abs(z)))
-                                 + np.maximum(z, 0.0) - y * z))
+            return reduce_loss(
+                np.log1p(np.exp(-np.abs(z)))
+                + np.maximum(z, 0.0) - y * z
+            )
 
     res = minimize_scalar(loss, bounds=(0.05, 50.0), method="bounded",
                           options={"xatol": 1e-4})
@@ -2197,7 +2219,8 @@ class ChimeraBoostClassifier(ClassifierMixin, BaseEstimator):
         # cross_features: None (auto default) and True run the same
         # validation-selected race everywhere, multiclass included (M1);
         # explicit False disables.
-        cal_Xv = cal_y = None   # validation set used to calibrate temperature
+        cal_Xv = cal_y = cal_weight = None
+        # Validation set used to calibrate temperature.
         # Cheap selection (benchmarks/PARETO_PLAN.md step 2): when
         # selection_rounds is set and the cross refit will run (pair
         # candidates exist iff >= 2 numeric columns), the base fit is only
@@ -2220,6 +2243,7 @@ class ChimeraBoostClassifier(ClassifierMixin, BaseEstimator):
             y_fit = y
             if eval_set is not None:
                 cal_Xv = eval_set[0]
+                cal_weight = eval_set[2] if len(eval_set) > 2 else None
         else:
             def _make(**extra):
                 return GradientBoosting(loss="Logloss", **extra, **kw)
@@ -2229,6 +2253,7 @@ class ChimeraBoostClassifier(ClassifierMixin, BaseEstimator):
                 cal_y = (np.asarray(eval_set[1]) == self.classes_[1]).astype(np.float64)
                 # Preserve any val-row weights through the 0/1 relabeling.
                 sw_v = eval_set[2] if len(eval_set) > 2 else None
+                cal_weight = sw_v
                 eval_set = (cal_Xv, cal_y, sw_v)
         self.model_ = _make()
         self.model_.fit(X, y_fit, cat_features=cat_features, eval_set=eval_set,
@@ -2297,7 +2322,9 @@ class ChimeraBoostClassifier(ClassifierMixin, BaseEstimator):
         self.temperature_ = 1.0
         if cal_Xv is not None:
             raw = self.model_.predict_raw(cal_Xv)
-            self.temperature_ = _fit_temperature(raw, cal_y, self._multiclass)
+            self.temperature_ = _fit_temperature(
+                raw, cal_y, self._multiclass, sample_weight=cal_weight
+            )
 
         # Full-data refit (benchmarks/REFIT_PLAN.md): reclaim the auto-split
         # data tax after early stopping, selection and temperature scaling
